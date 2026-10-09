@@ -1,28 +1,103 @@
 /**
- * API Integration Service for live weather telemetry (Open-Meteo) and live routing (OSRM).
- * Zero hardcoded dependencies; includes fallbacks for network resilience.
+ * API Integration Service connecting React Frontend to FastAPI Backend.
+ * Backend URL: http://localhost:8000
  */
 
-// Fetch ambient weather from Open-Meteo API
+const BACKEND_BASE_URL = 'http://localhost:8000';
+
+// Fetch crops catalog from FastAPI backend
+export async function fetchBackendCrops() {
+  try {
+    const res = await fetch(`${BACKEND_BASE_URL}/api/crops`);
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('Backend crops API unavailable, using local catalog:', err);
+  }
+  return null;
+}
+
+// Parse custom crop via FastAPI backend
+export async function parseCropBackend(cropName) {
+  try {
+    const res = await fetch(`${BACKEND_BASE_URL}/api/crops/parse`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ crop_name: cropName })
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('Backend parse crop API failed, fallback to local parser:', err);
+  }
+  return null;
+}
+
+// Evaluate biokinetics via FastAPI backend engine
+export async function evaluateKineticsBackend(params) {
+  try {
+    const res = await fetch(`${BACKEND_BASE_URL}/api/kinetics/evaluate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        t_base: params.tBase,
+        q10_factor: params.q10Factor,
+        ambient_shelf_life: params.ambientShelfLife,
+        harvest_age_days: params.harvestAgeDays,
+        price_per_kg: params.pricePerKg,
+        cargo_weight_kg: params.cargoWeightKg,
+        base_ambient_temp: params.baseAmbientTemp,
+        departure_hour: params.departureHour,
+        standard_distance_km: params.standardDistanceKm,
+        standard_duration_minutes: params.standardDurationMin,
+        q10_distance_km: params.q10DistanceKm,
+        q10_duration_minutes: params.q10DurationMin
+      })
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('Backend kinetics evaluation API failed, fallback to local math engine:', err);
+  }
+  return null;
+}
+
+// Fetch ambient weather telemetry
 export async function fetchLiveWeather(lat, lon) {
   try {
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true`;
+    const url = `${BACKEND_BASE_URL}/api/weather?lat=${lat}&lon=${lon}`;
     const response = await fetch(url);
-    if (!response.ok) throw new Error(`Weather API HTTP error! status: ${response.status}`);
-    const data = await response.json();
-    if (data && data.current_weather && typeof data.current_weather.temperature === 'number') {
+    if (response.ok) {
+      const data = await response.json();
       return {
-        temperature: data.current_weather.temperature,
-        windspeed: data.current_weather.windspeed,
-        isDay: data.current_weather.is_day === 1,
-        source: 'Live Open-Meteo Telemetry'
+        temperature: data.temperature,
+        windspeed: data.windspeed,
+        isDay: data.is_day,
+        source: data.source
       };
     }
   } catch (error) {
-    console.warn('Weather API failed, using regional agricultural climate fallback:', error);
+    // Direct Open-Meteo fallback
+    try {
+      const directUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true`;
+      const res = await fetch(directUrl);
+      if (res.ok) {
+        const data = await res.json();
+        return {
+          temperature: data.current_weather.temperature,
+          windspeed: data.current_weather.windspeed,
+          isDay: data.current_weather.is_day === 1,
+          source: 'Live Open-Meteo Telemetry'
+        };
+      }
+    } catch (e) {
+      console.warn('Weather fallback failed:', e);
+    }
   }
 
-  // Realistic fallback for Davangere / South India agricultural corridor
   return {
     temperature: 32.5,
     windspeed: 12.0,
@@ -41,11 +116,10 @@ export function generateWaypointTelemetry(coordinates, efTemp, routeLabel) {
 
   for (let i = 1; i <= count; i++) {
     const idx = Math.min(coordinates.length - 1, i * step);
-    const coord = coordinates[idx]; // [lon, lat] or [lat, lon] depending on structure
+    const coord = coordinates[idx];
     const lat = Array.isArray(coord) ? (coord[1] > 40 || coord[1] < -40 ? coord[0] : coord[1]) : coord.lat;
     const lon = Array.isArray(coord) ? (coord[0] > 40 || coord[0] < -40 ? coord[1] : coord[0]) : coord.lon;
 
-    // Small localized fluctuation (+/- 0.8°C) along the route segment
     const localVariance = ((i % 2 === 0 ? 0.6 : -0.4));
     const pointTemp = Number((efTemp + localVariance).toFixed(1));
 
@@ -66,18 +140,12 @@ export function generateWaypointTelemetry(coordinates, efTemp, routeLabel) {
 function generateCanopyBypassCoordinates(primaryCoords) {
   if (!primaryCoords || primaryCoords.length < 2) return primaryCoords;
   
-  // Create a slight arc/curve to simulate a scenic rural tree-canopy detour
   const n = primaryCoords.length;
-  const start = primaryCoords[0];
-  const end = primaryCoords[n - 1];
-
   const bypass = [];
   for (let i = 0; i < n; i++) {
     const fraction = i / (n - 1);
     const orig = primaryCoords[i];
-    
-    // Perpendicular offset for arc bending
-    const offsetMag = Math.sin(fraction * Math.PI) * 0.018; // ~2km offset
+    const offsetMag = Math.sin(fraction * Math.PI) * 0.018;
     const lat = orig[1] + offsetMag * 0.7;
     const lon = orig[0] - offsetMag * 0.9;
     
@@ -105,8 +173,6 @@ export async function fetchLiveRoutes(origin, dest) {
       const mainRoute = data.routes[0];
       const mainDistanceKm = Number((mainRoute.distance / 1000).toFixed(1));
       const mainDurationMin = Math.round(mainRoute.duration / 60);
-
-      // Extract geometry [lon, lat] -> convert to Leaflet [lat, lon]
       const mainPolyline = mainRoute.geometry.coordinates.map(c => [c[1], c[0]]);
 
       let q10Polyline;
@@ -119,11 +185,10 @@ export async function fetchLiveRoutes(origin, dest) {
         q10DistanceKm = Number((altRoute.distance / 1000).toFixed(1));
         q10DurationMin = Math.round(altRoute.duration / 60);
       } else {
-        // Synthesize canopy rural bypass
         const bypassCoords = generateCanopyBypassCoordinates(mainRoute.geometry.coordinates);
         q10Polyline = bypassCoords.map(c => [c[1], c[0]]);
-        q10DistanceKm = Number((mainDistanceKm * 1.08).toFixed(1)); // slightly longer distance
-        q10DurationMin = Math.round(mainDurationMin * 1.12); // slightly slower rural speed
+        q10DistanceKm = Number((mainDistanceKm * 1.08).toFixed(1));
+        q10DurationMin = Math.round(mainDurationMin * 1.12);
       }
 
       return {
@@ -148,7 +213,6 @@ export async function fetchLiveRoutes(origin, dest) {
     console.warn('OSRM routing network unavailable, generating geometric corridor fallback:', error);
   }
 
-  // Geometric fallback when offline
   const fallbackMain = [
     [originLat, originLon],
     [originLat + (destLat - originLat) * 0.35, originLon + (destLon - originLon) * 0.2],
